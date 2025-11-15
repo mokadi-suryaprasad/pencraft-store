@@ -1,0 +1,77 @@
+name: PreProd Pipeline
+
+on:
+  push:
+    branches: [ "preprod" ]
+    paths:
+      - "java-store/**"
+      - "frontend/**"
+      - ".github/workflows/preprod-pipeline.yml"
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup tools (Node, Java)
+        uses: actions/setup-node@v4
+        with: { node-version: 18 }
+      - uses: actions/setup-java@v4
+        with: { java-version: '17', distribution: 'temurin' }
+
+      - name: Build backend
+        working-directory: java-store
+        run: mvn -B -DskipTests package
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Configure Docker for GAR
+        run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev -q
+
+      - name: Build & push images (sha + latest)
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          docker build -t ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/pencraft/java-store:${GIT_SHA} ./java-store
+          docker push ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/pencraft/java-store:${GIT_SHA}
+          docker build -t ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/pencraft/frontend:${GIT_SHA} ./frontend
+          docker push ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/pencraft/frontend:${GIT_SHA}
+
+      - name: Trivy scan images
+        uses: aquasecurity/trivy-action@v0.12.0
+        with:
+          image-ref: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/pencraft/java-store:${{ github.sha }}
+
+      # DAST: run OWASP ZAP against preprod endpoint (adjust URL)
+      - name: Run OWASP ZAP baseline scan
+        run: |
+          docker run --rm -v $(pwd)/zapreport:/zap/wrk/:rw owasp/zap2docker-stable zap-baseline.py -t http://PREPROD-LOADBALANCER-IP/ -r zap_report.html
+        # you can upload zap_report.html to GCS here
+
+      # Update GitOps values-preprod.yaml & create PR
+      - name: Update GitOps preprod values
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          git clone https://github.com/${{ secrets.GITOPS_REPO }} gitops
+          cd gitops
+          git checkout -b auto/update/preprod-${GIT_SHA}
+          sed -i "s|frontend:.*|frontend:\n  image: \"asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/pencraft/frontend:${GIT_SHA}\"|g" envs/preprod/values-preprod.yaml
+          sed -i "s|backend:.*|backend:\n  image: \"asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/pencraft/java-store:${GIT_SHA}\"|g" envs/preprod/values-preprod.yaml
+          git add envs/preprod/values-preprod.yaml
+          git commit -m "chore: update preprod images to ${GIT_SHA}"
+          git push https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/${{ secrets.GITOPS_REPO }}.git HEAD
+      - name: Create PR for GitOps preprod
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          curl -s -X POST -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
+            -d "{\"title\":\"chore: update preprod images to ${GIT_SHA}\",\"head\":\"auto/update/preprod-${GIT_SHA}\",\"base\":\"main\",\"body\":\"Auto update preprod images to ${GIT_SHA}\"}" \
+            https://api.github.com/repos/${{ secrets.GITOPS_REPO }}/pulls

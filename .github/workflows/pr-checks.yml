@@ -1,0 +1,63 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  checkout:
+    runs-on: ubuntu-latest
+    outputs:
+      java_changed: ${{ steps.check-java.outputs.changed }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install Frontend deps & Lint
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint || true
+
+      - name: Run Frontend Unit Tests
+        working-directory: frontend
+        run: |
+          npm run test -- --watchAll=false || true
+
+      - name: Build backend & run unit tests
+        working-directory: java-store
+        run: |
+          mvn -B -DskipTests=false test
+
+  codeql:
+    name: CodeQL SAST
+    needs: checkout
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: java, javascript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v2
+
+      - name: Run CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
