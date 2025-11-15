@@ -34,13 +34,7 @@ jobs:
           npm install
           npm run lint --if-present
 
-      # Frontend Tests
-      - name: Run Frontend Tests
-        working-directory: frontend
-        run: |
-          npm install
-          npm run test -- --watchAll=false --if-present
-
+      # ❌ REMOVED: Frontend tests (because no test script exists)
       # Backend tests
       - name: Build backend & run unit tests
         working-directory: java-store
@@ -62,7 +56,7 @@ jobs:
         with:
           languages: java, javascript
 
-      # CodeQL Autobuild
+      # Autobuild
       - name: Autobuild
         uses: github/codeql-action/autobuild@v2
 
