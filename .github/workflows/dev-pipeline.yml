@@ -50,7 +50,7 @@ jobs:
       - name: Build frontend (React)
         working-directory: frontend
         run: |
-          npm ci
+          npm install
           npm run build
 
       # Upload frontend build to GCS
