@@ -1,14 +1,22 @@
-name: Dev Pipeline (PR Merge → Dev)
+name: Dev Pipeline (Push + PR Merge → Dev Deployment)
 
 on:
-  pull_request:
-    types: [closed]       # runs ONLY when PR is closed
+  push:
     branches:
-      - main              # only if PR was targeting main
+      - main
+    paths:
+      - "java-store/**"
+      - "frontend/**"
+      - ".github/workflows/dev-pipeline.yml"
+
+  pull_request:
+    types: [closed]
+    branches:
+      - main
 
 jobs:
   build:
-    if: github.event.pull_request.merged == true
+    if: github.event_name == 'push' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
     env:
@@ -18,131 +26,112 @@ jobs:
       GIT_SHA: ${{ github.sha }}
 
     steps:
-    # -------------------------
-    # CHECKOUT SOURCE
-    # -------------------------
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      # 1) Checkout repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    # -------------------------
-    # AUTH GOOGLE CLOUD
-    # -------------------------
-    - name: Authenticate to Google Cloud
-      uses: google-github-actions/auth@v2
-      with:
-        credentials_json: ${{ secrets.GCP_SA_KEY }}
+      # 2) GCP Auth
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-    - name: Setup gcloud SDK
-      uses: google-github-actions/setup-gcloud@v1
-      with:
-        project_id: ${{ secrets.GCP_PROJECT_ID }}
+      - name: Setup gcloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-    # -------------------------
-    # BACKEND BUILD + ARTIFACTS
-    # -------------------------
-    - name: Build backend (Spring Boot)
-      working-directory: java-store
-      run: mvn -B -DskipTests package
+      # 3) Build Backend
+      - name: Build backend JAR
+        working-directory: java-store
+        run: mvn -B -DskipTests package
 
-    - name: Upload backend JAR to GCS
-      run: |
-        gsutil cp java-store/target/*.jar gs://$PROJECT_ID-builds/$GIT_SHA/backend/
+      - name: Upload backend JAR to GCS
+        run: |
+          gsutil cp java-store/target/*.jar gs://$PROJECT_ID-builds/$GIT_SHA/backend/
 
-    # -------------------------
-    # FRONTEND BUILD + ARTIFACTS
-    # -------------------------
-    - name: Build frontend (React)
-      working-directory: frontend
-      run: |
-        npm install
-        npm run build
+      # 4) Build Frontend
+      - name: Build frontend (React)
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
 
-    - name: Upload frontend build to GCS
-      run: |
-        gsutil cp -r frontend/build gs://$PROJECT_ID-builds/$GIT_SHA/frontend/
+      - name: Upload frontend build to GCS
+        run: |
+          gsutil cp -r frontend/build gs://$PROJECT_ID-builds/$GIT_SHA/frontend/
 
-    # -------------------------
-    # AUTH DOCKER → GAR
-    # -------------------------
-    - name: Configure Docker for Artifact Registry
-      run: |
-        gcloud auth configure-docker $REGION-docker.pkg.dev -q
+      # 5) Configure Docker for GAR
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker $REGION-docker.pkg.dev -q
 
-    # -------------------------
-    # BUILD BACKEND DOCKER
-    # -------------------------
-    - name: Build backend image
-      run: |
-        docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA ./java-store
-        docker tag  $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA \
-                    $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:latest
+      # 6) Build Backend Image
+      - name: Build backend Docker image
+        run: |
+          docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:$GIT_SHA ./java-store
+          docker tag  $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:$GIT_SHA \
+                      $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:latest
 
-    # -------------------------
-    # BUILD FRONTEND DOCKER
-    # -------------------------
-    - name: Build frontend image
-      run: |
-        docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA ./frontend
-        docker tag  $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA \
-                    $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
+      # 7) Build Frontend Image
+      - name: Build frontend Docker image
+        run: |
+          docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/frontend:$GIT_SHA ./frontend
+          docker tag  $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/frontend:$GIT_SHA \
+                      $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/frontend:latest
 
-    # -------------------------
-    # TRIVY SCAN
-    # -------------------------
-    - name: Install Trivy
-      run: |
-        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+      # 8) Install Trivy
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
           | sh -s -- -b /usr/local/bin
 
-    - name: Trivy scan backend
-      run: |
-        trivy image --exit-code 0 --severity HIGH,CRITICAL \
-        $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA
+      # 9) Trivy Scan Backend
+      - name: Scan backend image using Trivy
+        run: |
+          trivy image --exit-code 0 --severity HIGH,CRITICAL \
+          $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:$GIT_SHA
 
-    - name: Trivy scan frontend
-      run: |
-        trivy image --exit-code 0 --severity HIGH,CRITICAL \
-        $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
+      # 10) Trivy Scan Frontend
+      - name: Scan frontend image using Trivy
+        run: |
+          trivy image --exit-code 0 --severity HIGH,CRITICAL \
+          $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/frontend:$GIT_SHA
 
-    # -------------------------
-    # PUSH TO GAR
-    # -------------------------
-    - name: Push backend image
-      run: |
-        docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA
-        docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:latest
+      # 11) Push Docker Images to GAR
+      - name: Push backend image
+        run: |
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:$GIT_SHA
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:latest
 
-    - name: Push frontend image
-      run: |
-        docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
-        docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
+      - name: Push frontend image
+        run: |
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/frontend:$GIT_SHA
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/frontend:latest
 
-    # -------------------------
-    # UPDATE GITOPS REPO (DEV)
-    # -------------------------
-    - name: Clone GitOps repo
-      run: |
-        git clone https://github.com/${{ secrets.GITOPS_REPO }} gitops
-        cd gitops
-        git checkout -b auto-update-dev-$GIT_SHA
+      # 12) Update GitOps Repo
+      - name: Update GitOps Repo (pencraft-gitops)
+        run: |
+          git clone https://github.com/mokadi-suryaprasad/pencraft-gitops.git gitops
+          cd gitops
 
-        # Update backend image
-        sed -i "s|image:.*java-store.*|image: $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:$GIT_SHA|g" envs/dev/values-dev.yaml
+          git checkout -b auto-update-dev-$GIT_SHA
 
-        # Update frontend image
-        sed -i "s|image:.*frontend.*|image: $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/frontend:$GIT_SHA|g" envs/dev/values-dev.yaml
+          sed -i "s|java-store:.*|java-store: $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:$GIT_SHA|g" envs/dev/values-dev.yaml
+          sed -i "s|frontend:.*|frontend: $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/frontend:$GIT_SHA|g" envs/dev/values-dev.yaml
 
-        git add envs/dev/values-dev.yaml
-        git commit -m "chore: update DEV images to $GIT_SHA"
-        git push https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/${{ secrets.GITOPS_REPO }}.git HEAD
+          git add envs/dev/values-dev.yaml
+          git commit -m "Auto-update Dev images to $GIT_SHA"
 
-    # -------------------------
-    # CREATE PR IN GITOPS
-    # -------------------------
-    - name: Create PR in GitOps Repo
-      run: |
-        curl -X POST -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
-        -d "{\"title\":\"Update DEV images to $GIT_SHA\",\"head\":\"auto-update-dev-$GIT_SHA\",\"base\":\"main\"}" \
-        https://api.github.com/repos/${{ secrets.GITOPS_REPO }}/pulls
+          git push https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/mokadi-suryaprasad/pencraft-gitops.git HEAD
+
+      # 13) Create Pull Request in GitOps Repo
+      - name: Create PR in GitOps Repo
+        run: |
+          curl -X POST -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
+          -d "{\"title\":\"Update Dev Images to $GIT_SHA\", \
+               \"head\":\"auto-update-dev-$GIT_SHA\", \
+               \"base\":\"main\"}" \
+          https://api.github.com/repos/mokadi-suryaprasad/pencraft-gitops/pulls
