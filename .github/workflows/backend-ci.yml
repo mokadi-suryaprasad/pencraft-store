@@ -1,0 +1,53 @@
+name: Backend CI (Java Store)
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "java-store/**"
+      - ".github/workflows/backend-ci.yml"
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+
+    env:
+      REGION: ${{ secrets.GCP_REGION }}
+      PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      REPO: pencraft
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Authenticate to Google Cloud
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker $REGION-docker.pkg.dev
+
+      # Build Spring Boot App
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build Backend JAR
+        working-directory: java-store
+        run: mvn -B -DskipTests package
+
+      # Docker Build
+      - name: Build Backend Docker Image
+        run: |
+          docker build \
+            -t $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:latest \
+            ./java-store
+
+      # Push to GAR
+      - name: Push Backend Image
+        run: |
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/pencraft/java-store:latest
