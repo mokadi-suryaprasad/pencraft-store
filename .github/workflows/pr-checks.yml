@@ -1,9 +1,14 @@
 name: Feature Branch CI
 
+permissions:
+  contents: read
+  actions: read
+  security-events: write   # <-- Fixes CodeQL upload failure
+
 on:
   push:
     branches:
-      - "feature/*"      # Runs ONLY when pushing to feature branches
+      - "feature/*"
 
 jobs:
   checkout:
@@ -14,28 +19,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Setup Node (Frontend)
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      # Setup Java (Backend)
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      # Install & Lint Frontend
       - name: Install Frontend dependencies & Lint
         working-directory: frontend
         run: |
           npm install
           npm run lint --if-present
 
-      # ❌ REMOVED: Frontend tests (because no test script exists)
-      # Backend tests
       - name: Build backend & run unit tests
         working-directory: java-store
         run: |
@@ -46,20 +46,22 @@ jobs:
     needs: checkout
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      actions: read
+      security-events: write    # <-- required again for this job
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Initialize CodeQL
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v2
         with:
           languages: java, javascript
 
-      # Autobuild
       - name: Autobuild
         uses: github/codeql-action/autobuild@v2
 
-      # Run CodeQL Analysis
       - name: Run CodeQL Analysis
         uses: github/codeql-action/analyze@v2
