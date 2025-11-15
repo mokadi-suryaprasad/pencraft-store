@@ -3,14 +3,14 @@ name: Prod Pipeline (release)
 on:
   push:
     tags:
-      - 'v*.*.*'         # release tags like v1.2.3
+      - 'v*.*.*'
     branches:
-      - 'release/**'     # or pushing to release/* branches (optional)
+      - 'release/**'
 
 permissions:
   contents: read
   packages: write
-  id-token: write
+  id-token: write   # required for OIDC
 
 jobs:
   prod-release:
@@ -20,49 +20,78 @@ jobs:
       REGION: ${{ secrets.GCP_REGION }}
       PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
       BUCKET: ${{ secrets.GCP_PROJECT_ID }}-builds
-      GITOPS_REPO: ${{ secrets.GITOPS_REPO }}
-      # RELEASE_TAG will be computed in the workflow
+      GITOPS_REPO: ${{ secrets.GITOPS_REPO }}  # owner/repo
+      # Optional: set these secrets if using Workload Identity
+      # WORKLOAD_IDENTITY_PROVIDER: projects/123/locations/global/workloadIdentityPools/pool/providers/provider
+      # GCP_SA_EMAIL: my-sa@PROJECT_ID.iam.gserviceaccount.com
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (full history for tags)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Authenticate to Google Cloud
+      - name: Compute RELEASE_TAG
+        id: tag
+        run: |
+          set -euxo pipefail
+          # Prefer GitHub-provided names (ref_name/ref_type) if available
+          REF_NAME="${GITHUB_REF_NAME:-}"
+          REF_TYPE="${GITHUB_REF_TYPE:-}"
+          if [ -z "$REF_NAME" ]; then
+            case "${GITHUB_REF}" in
+              refs/tags/*) REF_NAME="${GITHUB_REF#refs/tags/}"; REF_TYPE="tag" ;;
+              refs/heads/*) REF_NAME="${GITHUB_REF#refs/heads/}"; REF_TYPE="branch" ;;
+              *) REF_NAME="${GITHUB_REF}"; REF_TYPE="other" ;;
+            esac
+          fi
+          if [[ "$REF_TYPE" == "branch" && "$REF_NAME" == release/* ]]; then
+            RELEASE=${REF_NAME//\//-}
+          else
+            RELEASE="$REF_NAME"
+          fi
+          echo "RELEASE_TAG=$RELEASE" >> "$GITHUB_OUTPUT"
+
+      ### AUTH: prefer OIDC Workload Identity if configured, else fall back to SA JSON
+      - name: Authenticate to Google Cloud (OIDC or SA key)
+        id: gcp-auth
         uses: google-github-actions/auth@v2
         with:
+          # If you set WORKLOAD_IDENTITY_PROVIDER & GCP_SA_EMAIL as repo secrets, auth@v2 will use OIDC
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+          # If you prefer to use JSON key, set GCP_SA_KEY secret and uncomment the next field:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup gcloud (export ADC so gsutil picks it up)
+        uses: google-github-actions/setup-gcloud@v1
         with:
-          node-version: 18
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          export_default_credentials: true
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${REGION}-docker.pkg.dev -q
+
+      - name: Ensure GCS bucket exists
+        run: |
+          set -euxo pipefail
+          # gsutil will now use Application Default Credentials exported by setup-gcloud
+          gsutil ls gs://$BUCKET || gsutil mb -l $REGION gs://$BUCKET
+
+      # Cache Maven
+      - name: Cache Maven local repo
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-
 
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
+          distribution: temurin
           java-version: '17'
-          distribution: 'temurin'
-
-      - name: Ensure GCS bucket exists
-        run: |
-          gsutil ls gs://$BUCKET || gsutil mb -l $REGION gs://$BUCKET
-
-      - name: Compute RELEASE_TAG
-        id: tag
-        run: |
-          # If triggered by tag, GITHUB_REF is like refs/tags/v1.2.3
-          # If triggered by branch (release/*) set RELEASE_TAG from branch name
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            RELEASE=${GITHUB_REF#refs/tags/}
-          else
-            # When pushing to release/branch, use branch name (strip refs/heads/)
-            RELEASE=${GITHUB_REF#refs/heads/}
-            # sanitize slashes for tag usage
-            RELEASE=${RELEASE//\//-}
-          fi
-          echo "RELEASE_TAG=$RELEASE" >> $GITHUB_OUTPUT
 
       - name: Build backend (Spring Boot)
         working-directory: java-store
@@ -72,84 +101,101 @@ jobs:
         run: |
           gsutil cp java-store/target/*.jar gs://$BUCKET/${{ steps.tag.outputs.RELEASE_TAG }}/backend/ || true
 
+      # Cache node modules
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: node-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
       - name: Build frontend (React)
         working-directory: frontend
         run: |
-          # use npm install to avoid failing when package-lock.json is missing
-          npm install
+          npm ci
           npm run build
 
       - name: Upload frontend artifact (optional)
         run: |
           gsutil cp -r frontend/build gs://$BUCKET/${{ steps.tag.outputs.RELEASE_TAG }}/frontend/ || true
 
-      - name: Configure Docker for Artifact Registry
-        run: |
-          gcloud auth configure-docker $REGION-docker.pkg.dev -q
-
       - name: Build and tag images (release)
+        env:
+          RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
-          RELEASE=${{ steps.tag.outputs.RELEASE_TAG }}
-          echo "Building images for release: $RELEASE"
-          docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$RELEASE ./java-store
-          docker tag  $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$RELEASE \
-                      $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:latest
-          docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$RELEASE ./frontend
-          docker tag  $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$RELEASE \
-                      $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
+          set -euxo pipefail
+          docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} ./java-store
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} \
+                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
+          docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} ./frontend
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} \
+                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
 
-      - name: Install Trivy (reliable manual install)
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-           | sh -s -- -b /usr/local/bin
-
-      - name: Trivy scan backend (high/critical only)
-        run: |
-          RELEASE=${{ steps.tag.outputs.RELEASE_TAG }}
-          trivy image --exit-code 0 --severity HIGH,CRITICAL \
-            $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$RELEASE
-
-      - name: Trivy scan frontend (high/critical only)
-        run: |
-          RELEASE=${{ steps.tag.outputs.RELEASE_TAG }}
-          trivy image --exit-code 0 --severity HIGH,CRITICAL \
-            $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$RELEASE
+      - name: Run Trivy scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v1
+        with:
+          image-ref: |
+            ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${{ steps.tag.outputs.RELEASE_TAG }}
+            ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${{ steps.tag.outputs.RELEASE_TAG }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'   # 1 = fail workflow on findings
 
       - name: Push images to GAR
-        run: |
-          RELEASE=${{ steps.tag.outputs.RELEASE_TAG }}
-          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$RELEASE
-          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:latest
-          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$RELEASE
-          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
-
-      - name: Update GitOps repo (create release branch)
         env:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
-          git clone https://github.com/${GITOPS_REPO}.git gitops
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
+
+      - name: Update GitOps repo (create release branch and update values)
+        env:
+          RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
+        run: |
+          set -euxo pipefail
+          # Use token-authenticated clone (GITOPS_REPO should be owner/repo)
+          git clone https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/${{ secrets.GITOPS_REPO }}.git gitops
           cd gitops
-
-          # fix identity for commits
-          git config --global user.email "mspr9773@gmail.com"
-          git config --global user.name "Mokadi Surya Prasad"
-
+          git config user.email "mspr9773@gmail.com"
+          git config user.name "Mokadi Surya Prasad"
           BRANCH="release/${RELEASE}"
-          git checkout -b "$BRANCH"
+          if git ls-remote --heads origin "${BRANCH}" | grep -q "${BRANCH}"; then
+            git checkout "${BRANCH}"
+          else
+            git checkout -b "${BRANCH}"
+          fi
 
-          # Update prod values - adjust sed to match your YAML structure if needed
-          sed -i "s|java-store:.*|java-store: $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:${RELEASE}|g" envs/prod/values-prod.yaml
-          sed -i "s|frontend:.*|frontend: $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:${RELEASE}|g" envs/prod/values-prod.yaml
+          # Update YAML values: use yq when available, else sed fallback
+          if command -v yq >/dev/null 2>&1; then
+            yq eval ".java-store = \"${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}\"" -i envs/prod/values-prod.yaml
+            yq eval ".frontend = \"${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}\"" -i envs/prod/values-prod.yaml
+          else
+            sed -i "s|java-store:.*|java-store: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}|g" envs/prod/values-prod.yaml
+            sed -i "s|frontend:.*|frontend: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}|g" envs/prod/values-prod.yaml
+          fi
 
           git add envs/prod/values-prod.yaml
-          git commit -m "chore(release): update prod images to ${RELEASE}"
-          git push https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/${GITOPS_REPO}.git HEAD
+          git commit -m "chore(release): update prod images to ${RELEASE}" || echo "No changes to commit"
+          git push origin HEAD
 
-      - name: Create PR for production release
+      - name: Create PR for production release (if none exists)
         env:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
           BRANCH="release/${RELEASE}"
-          curl -s -X POST -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
-            -d "{\"title\":\"Release ${RELEASE}: update prod images\",\"head\":\"${BRANCH}\",\"base\":\"main\",\"body\":\"Release ${RELEASE} - update Helm images\"}" \
-            https://api.github.com/repos/${GITOPS_REPO}/pulls
+          EXISTING_PR=$(curl -s -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
+            "https://api.github.com/repos/${{ secrets.GITOPS_REPO }}/pulls?head=${{ github.repository_owner }}:${BRANCH}&state=open" | jq '.[0].html_url // empty' -r)
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR already exists: $EXISTING_PR"
+          else
+            curl -s -X POST -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
+              -d "{\"title\":\"Release ${RELEASE}: update prod images\",\"head\":\"${BRANCH}\",\"base\":\"main\",\"body\":\"Release ${RELEASE} - update Helm images\"}" \
+              "https://api.github.com/repos/${{ secrets.GITOPS_REPO }}/pulls"
+          fi
