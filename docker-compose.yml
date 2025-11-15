@@ -1,0 +1,28 @@
+services:
+  java-store:
+    build:
+      context: ./java-store
+      dockerfile: Dockerfile
+    image: java-store:docker-build
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+    # Healthcheck using an existing backend endpoint
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/products || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: java-store-frontend:latest
+    ports:
+      - "3000:80"
+    depends_on:
+      java-store:
+        condition: service_healthy
+    restart: unless-stopped
