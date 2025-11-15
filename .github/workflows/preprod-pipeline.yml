@@ -9,8 +9,16 @@ on:
       - "frontend/**"
       - ".github/workflows/preprod-pipeline.yml"
 
+  pull_request:
+    types: [closed]            # runs ONLY when PR closes
+    branches:
+      - preprod                # PR must target preprod
+
 jobs:
   preprod-build:
+    # Run only when push happens OR PR was merged
+    if: github.event_name == 'push' || github.event.pull_request.merged == true
+
     runs-on: ubuntu-latest
 
     env:
@@ -79,13 +87,13 @@ jobs:
           docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA ./frontend
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
 
-      # 8) Install Trivy (manual install—works 100%)
+      # 8) Install Trivy
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
           | sh -s -- -b /usr/local/bin
 
-      # 9) Trivy Scan
+      # 9) Trivy Scans
       - name: Scan backend image with Trivy
         run: |
           trivy image --exit-code 0 --severity HIGH,CRITICAL \
@@ -96,19 +104,7 @@ jobs:
           trivy image --exit-code 0 --severity HIGH,CRITICAL \
           $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
 
-      # 10) OWASP ZAP DAST Scan
-      #- name: Run OWASP ZAP baseline scan
-      #  run: |
-      #  mkdir -p zapreport
-       #   docker run --rm -v $(pwd)/zapreport:/zap/wrk/:rw \
-       #     owasp/zap2docker-stable \
-        #    zap-baseline.py -t http://PREPROD-LOADBALANCER-IP/ \
-         #   -r zap_report.html
-
-      # OPTIONAL: upload zap report
-      # gsutil cp zapreport/zap_report.html gs://$BUCKET/$GIT_SHA/zap/
-
-      # 11) Update GitOps repo (values-preprod.yaml)
+      # 10) Update GitOps repo
       - name: Update GitOps Repo
         run: |
           git clone https://github.com/$GITOPS_REPO.git gitops
@@ -119,7 +115,6 @@ jobs:
 
           git checkout -b auto-update-preprod-$GIT_SHA
 
-          # Update images in YAML
           sed -i "s|java-store:.*|java-store: $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA|g" envs/preprod/values-preprod.yaml
           sed -i "s|frontend:.*|frontend: $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA|g" envs/preprod/values-preprod.yaml
 
@@ -127,7 +122,7 @@ jobs:
           git commit -m "Update PreProd images to $GIT_SHA"
           git push https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/$GITOPS_REPO.git HEAD
 
-      # 12) Create PR in GitOps repo
+      # 11) Create PR
       - name: Create PR to GitOps repo
         run: |
           curl -s -X POST -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
