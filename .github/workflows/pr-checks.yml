@@ -1,8 +1,9 @@
-name: PR Checks
+name: Feature Branch CI
 
 on:
-  pull_request:
-    branches: [ "main" ]
+  push:
+    branches:
+      - "feature/*"      # Runs ONLY when pushing to feature branches
 
 jobs:
   checkout:
@@ -15,28 +16,33 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Node
+      # Setup Node (Frontend)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
+      # Setup Java (Backend)
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Install Frontend deps & Lint
+      # Install & Lint Frontend
+      - name: Install Frontend dependencies & Lint
         working-directory: frontend
         run: |
           npm ci
-          npm run lint || true
+          npm run lint --if-present
 
-      - name: Run Frontend Unit Tests
+      # Frontend Tests
+      - name: Run Frontend Tests
         working-directory: frontend
         run: |
-          npm run test -- --watchAll=false || true
+          npm run test -- --watchAll=false --if-present
 
+      # Backend Tests
       - name: Build backend & run unit tests
         working-directory: java-store
         run: |
@@ -51,13 +57,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Initialize CodeQL
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v2
         with:
           languages: java, javascript
 
+      # Autobuild (Java + JS)
       - name: Autobuild
         uses: github/codeql-action/autobuild@v2
 
+      # Run SAST Analysis
       - name: Run CodeQL Analysis
         uses: github/codeql-action/analyze@v2
