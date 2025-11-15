@@ -8,8 +8,6 @@ on:
 jobs:
   checkout:
     runs-on: ubuntu-latest
-    outputs:
-      java_changed: ${{ steps.check-java.outputs.changed }}
 
     steps:
       - uses: actions/checkout@v4
@@ -33,16 +31,17 @@ jobs:
       - name: Install Frontend dependencies & Lint
         working-directory: frontend
         run: |
-          npm ci
+          npm install
           npm run lint --if-present
 
       # Frontend Tests
       - name: Run Frontend Tests
         working-directory: frontend
         run: |
+          npm install
           npm run test -- --watchAll=false --if-present
 
-      # Backend Tests
+      # Backend tests
       - name: Build backend & run unit tests
         working-directory: java-store
         run: |
@@ -63,10 +62,10 @@ jobs:
         with:
           languages: java, javascript
 
-      # Autobuild (Java + JS)
+      # CodeQL Autobuild
       - name: Autobuild
         uses: github/codeql-action/autobuild@v2
 
-      # Run SAST Analysis
+      # Run CodeQL Analysis
       - name: Run CodeQL Analysis
         uses: github/codeql-action/analyze@v2
