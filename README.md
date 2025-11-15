@@ -1,4 +1,8 @@
-# 🖊️ PenCraft – Modern Pen Store Application
+# 🖊️ PenCraft – Modern Pen Store Application 
+![Docker](https://img.shields.io/badge/Docker-✔-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?style=for-the-badge&logo=react&logoColor=white)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.2.0-6DB33F?style=for-the-badge&logo=springboot&logoColor=white)
+![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen?style=for-the-badge)
 
 PenCraft is a full-stack mini e-commerce application built with:
 
