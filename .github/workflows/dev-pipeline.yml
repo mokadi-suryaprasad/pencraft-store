@@ -3,7 +3,7 @@ name: Dev Pipeline (PR Merge → Dev)
 on:
   pull_request:
     types:
-      - closed     # triggers only when PR closes
+      - closed     ## triggers only when PR closes
     branches:
       - main       # only if PR was targeting main
 
