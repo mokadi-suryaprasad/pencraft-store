@@ -117,7 +117,7 @@ jobs:
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
 
-      # 12) Update GitOps Repo - push directly to main (fixed: use awk to avoid sed delimiter issues)
+      # 12) Update GitOps Repo - push directly to main (using yq, safe YAML edit)
       - name: Update GitOps Repo (pencraft-gitops) - push to main
         env:
           GITOPS_REPO: "mokadi-suryaprasad/pencraft-gitops"
@@ -142,29 +142,20 @@ jobs:
           git pull origin main
 
           # Prepare new image references
+          # Here we set the full image string. Using a tag (sha) instead of digest.
           NEW_BACKEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA"
           NEW_FRONTEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA"
 
-          # Update the file in a safe way using awk (preserves indentation)
-          # - Replace entire line that starts with optional spaces then 'java-store:'
-          # - Replace entire line that starts with optional spaces then 'frontend:'
-          awk -v nb="$NEW_BACKEND" -v nf="$NEW_FRONTEND" '
-            {
-              # match leading whitespace + key
-              if ($0 ~ /^[[:space:]]*java-store:[[:space:]]*/) {
-                # capture leading whitespace
-                match($0, /^[[:space:]]*/)
-                lead = substr($0, RSTART, RLENGTH)
-                print lead "java-store: " nb
-              } else if ($0 ~ /^[[:space:]]*frontend:[[:space:]]*/) {
-                match($0, /^[[:space:]]*/)
-                lead = substr($0, RSTART, RLENGTH)
-                print lead "frontend: " nf
-              } else {
-                print $0
-              }
-            }
-          ' envs/dev/values-dev.yaml > envs/dev/values-dev.yaml.tmp && mv envs/dev/values-dev.yaml.tmp envs/dev/values-dev.yaml
+          # Install mikefarah/yq (if not present)
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "Installing yq..."
+            wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x /usr/local/bin/yq
+          fi
+
+          # Update YAML fields safely
+          yq eval -i '.backend.image = strenv(NEW_BACKEND)' envs/dev/values-dev.yaml
+          yq eval -i '.frontend.image = strenv(NEW_FRONTEND)' envs/dev/values-dev.yaml
 
           # show diff for logs (helpful for troubleshooting)
           git --no-pager diff -- envs/dev/values-dev.yaml || true
