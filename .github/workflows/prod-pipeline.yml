@@ -10,7 +10,7 @@ on:
 permissions:
   contents: read
   packages: write
-  id-token: write   # required for OIDC
+  id-token: write
 
 jobs:
   prod-release:
@@ -20,7 +20,7 @@ jobs:
       REGION: ${{ secrets.GCP_REGION }}
       PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
       BUCKET: ${{ secrets.GCP_PROJECT_ID }}-builds
-      GITOPS_REPO: ${{ secrets.GITOPS_REPO }}  # owner/repo
+      GITOPS_REPO: ${{ secrets.GITOPS_REPO }}
 
     steps:
       - name: Checkout repository (full history for tags)
@@ -48,7 +48,7 @@ jobs:
           fi
           echo "RELEASE_TAG=$RELEASE" >> "$GITHUB_OUTPUT"
 
-      - name: Authenticate to Google Cloud (OIDC or SA key)
+      - name: Authenticate to Google Cloud
         id: gcp-auth
         uses: google-github-actions/auth@v2
         with:
@@ -56,19 +56,17 @@ jobs:
           service_account: ${{ secrets.GCP_SA_EMAIL }}
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Setup gcloud (export ADC so gsutil picks it up)
+      - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v1
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
           export_default_credentials: true
 
       - name: Configure Docker for Artifact Registry
-        run: |
-          gcloud auth configure-docker ${REGION}-docker.pkg.dev -q
+        run: gcloud auth configure-docker ${REGION}-docker.pkg.dev -q
 
       - name: Ensure GCS bucket exists
         run: |
-          set -euxo pipefail
           gsutil ls gs://$BUCKET || gsutil mb -l $REGION gs://$BUCKET
 
       - name: Cache Maven local repo
@@ -88,9 +86,8 @@ jobs:
         working-directory: java-store
         run: mvn -B -DskipTests package
 
-      - name: Upload backend artifact (optional)
-        run: |
-          gsutil cp java-store/target/*.jar gs://$BUCKET/${{ steps.tag.outputs.RELEASE_TAG }}/backend/ || true
+      - name: Upload backend artifact
+        run: gsutil cp java-store/target/*.jar gs://$BUCKET/${{ steps.tag.outputs.RELEASE_TAG }}/backend/ || true
 
       - name: Cache node modules
         uses: actions/cache@v4
@@ -104,30 +101,27 @@ jobs:
         with:
           node-version: 18
 
-      - name: Build frontend (React)
+      - name: Build frontend
         working-directory: frontend
         run: |
           npm ci
           npm run build
 
-      - name: Upload frontend artifact (optional)
-        run: |
-          gsutil cp -r frontend/build gs://$BUCKET/${{ steps.tag.outputs.RELEASE_TAG }}/frontend/ || true
+      - name: Upload frontend artifact
+        run: gsutil cp -r frontend/build gs://$BUCKET/${{ steps.tag.outputs.RELEASE_TAG }}/frontend/ || true
 
-      - name: Build and tag images (release)
+      - name: Build and tag images
         env:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
-          set -euxo pipefail
           docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} ./java-store
-          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} \
-                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
           docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} ./frontend
-          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} \
-                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
 
+      # ========= FIXED TRIVY STEP ==========
       - name: Run Trivy scan (fail on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@v1
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           image-ref: |
             ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${{ steps.tag.outputs.RELEASE_TAG }}
@@ -135,6 +129,7 @@ jobs:
           format: 'table'
           severity: 'CRITICAL,HIGH'
           exit-code: '1'
+      # =====================================
 
       - name: Push images to GAR
         env:
@@ -145,81 +140,33 @@ jobs:
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
 
-      - name: Update GitOps repo — update existing release branch (no branch creation)
+      - name: Update GitOps repo (update existing release branch)
         env:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
           GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
         run: |
           set -euxo pipefail
-
-          echo "Cloning GitOps repo: ${{ secrets.GITOPS_REPO }}"
           git clone https://x-access-token:${GITOPS_PAT}@github.com/${{ secrets.GITOPS_REPO }}.git gitops
           cd gitops
-
           git config user.email "mspr9773@gmail.com"
           git config user.name "Mokadi Surya Prasad"
 
           BRANCH="release/${RELEASE}"
-          echo "Will update existing branch: ${BRANCH}"
+          git fetch origin ${BRANCH}
+          git checkout ${BRANCH}
+          git pull origin ${BRANCH}
 
-          # Ensure branch exists on remote; fail fast if not
-          if ! git ls-remote --heads origin "${BRANCH}" | grep -q "${BRANCH}"; then
-            echo "ERROR: branch ${BRANCH} does not exist in gitops repo. Exiting."
-            exit 1
-          fi
-
-          git fetch origin "${BRANCH}"
-          git checkout "${BRANCH}"
-          git pull origin "${BRANCH}"
-
-          # Prepare new image strings (tag-based)
           export NEW_BACKEND="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}"
           export NEW_FRONTEND="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}"
 
-          echo "NEW_BACKEND=${NEW_BACKEND}"
-          echo "NEW_FRONTEND=${NEW_FRONTEND}"
-
-          # show file before edit
-          echo "---- envs/prod/values-prod.yaml (before) ----"
-          sed -n '1,200p' envs/prod/values-prod.yaml || true
-          echo "---------------------------------------------"
-
-          # install yq if missing
-          if ! command -v yq >/dev/null 2>&1; then
-            echo "Installing yq..."
+          if ! command -v yq >/dev/null; then
             wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
             chmod +x /usr/local/bin/yq
           fi
 
-          echo "yq version: $(yq --version || true)"
-
-          # Update nested YAML keys safely. Adjust paths if your YAML uses different keys.
-          # We're targeting:
-          # backend.image
-          # frontend.image
           yq eval -i '.backend.image = strenv(NEW_BACKEND)' envs/prod/values-prod.yaml
           yq eval -i '.frontend.image = strenv(NEW_FRONTEND)' envs/prod/values-prod.yaml
 
-          # show file after edit
-          echo "---- envs/prod/values-prod.yaml (after) ----"
-          sed -n '1,200p' envs/prod/values-prod.yaml || true
-          echo "--------------------------------------------"
-
-          # show read-back sanity checks
-          echo "yq read backend.image: $(yq eval '.backend.image' envs/prod/values-prod.yaml || true)"
-          echo "yq read frontend.image: $(yq eval '.frontend.image' envs/prod/values-prod.yaml || true)"
-
-          # Git commit & push
           git add envs/prod/values-prod.yaml
-          if git diff --cached --quiet -- envs/prod/values-prod.yaml; then
-            echo "No changes to commit."
-          else
-            git commit -m "chore(release): update prod images to ${RELEASE}"
-            echo "Committed:"
-            git --no-pager log -1 --pretty=oneline
-          fi
-
-          echo "Pushing branch ${BRANCH}..."
-          git push https://x-access-token:${GITOPS_PAT}@github.com/${{ secrets.GITOPS_REPO }}.git ${BRANCH}
-
-          echo "Update complete."
+          git commit -m "update prod images to ${RELEASE}" || echo "no changes"
+          git push origin ${BRANCH}
