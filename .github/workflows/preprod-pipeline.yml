@@ -8,17 +8,16 @@ on:
       - "java-store/**"
       - "frontend/**"
       - ".github/workflows/preprod-pipeline.yml"
-
   pull_request:
     types: [closed]
     branches:
       - preprod
+  workflow_dispatch: {}
 
 jobs:
   preprod-build:
-    if: github.event_name == 'push' || github.event.pull_request.merged == true
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
-
     env:
       REGION: ${{ secrets.GCP_REGION }}
       PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -28,13 +27,19 @@ jobs:
       GITOPS_REPO: mokadi-suryaprasad/pencraft-gitops
 
     steps:
-      # 1) Checkout
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) Authenticate to GCP
+      - name: Debug event
+        run: |
+          echo "EVENT_NAME=$GITHUB_EVENT_NAME"
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          git fetch --no-tags --prune --depth=1 origin "$GITHUB_REF" || true
+          git --no-pager show --name-only --pretty="" "$GITHUB_SHA" || true
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -45,21 +50,16 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      # 3) Ensure bucket exists
       - name: Ensure GCS bucket exists
-        run: |
-          gsutil ls gs://$BUCKET || gsutil mb -l $REGION gs://$BUCKET
+        run: gsutil ls gs://$BUCKET || gsutil mb -l $REGION gs://$BUCKET
 
-      # 4) Build backend
       - name: Build Spring Boot backend
         working-directory: java-store
         run: mvn -B -DskipTests package
 
       - name: Upload backend JAR to GCS
-        run: |
-          gsutil cp java-store/target/*.jar gs://$BUCKET/$GIT_SHA/backend/
+        run: gsutil cp java-store/target/*.jar gs://$BUCKET/$GIT_SHA/backend/ || true
 
-      # 5) Build frontend
       - name: Build React frontend
         working-directory: frontend
         run: |
@@ -67,103 +67,74 @@ jobs:
           npm run build
 
       - name: Upload frontend build to GCS
-        run: |
-          gsutil cp -r frontend/build gs://$BUCKET/$GIT_SHA/frontend/
+        run: gsutil cp -r frontend/build gs://$BUCKET/$GIT_SHA/frontend/ || true
 
-      # 6) Configure Docker for GAR
-      - name: Configure Docker for Google Artifact Registry
+      - name: Configure Docker for GAR
         run: gcloud auth configure-docker $REGION-docker.pkg.dev -q
 
-      # 7) Build images
-      - name: Build & tag backend image
+      - name: Build & push backend image
         run: |
           docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA ./java-store
-          docker tag $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA \
-                     $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:latest
+          docker tag $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:latest
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:latest
 
-      - name: Build & tag frontend image
+      - name: Build & push frontend image
         run: |
           docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA ./frontend
-          docker tag $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA \
-                     $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
+          docker tag $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
 
-      # 8) Install Trivy
       - name: Install Trivy
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-          | sh -s -- -b /usr/local/bin
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
 
-      # 9) Trivy Scans
       - name: Scan backend image with Trivy
-        run: |
-          trivy image --exit-code 0 --severity HIGH,CRITICAL \
-          $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA
+        run: trivy image --exit-code 0 --severity HIGH,CRITICAL $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA
 
       - name: Scan frontend image with Trivy
-        run: |
-          trivy image --exit-code 0 --severity HIGH,CRITICAL \
-          $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
+        run: trivy image --exit-code 0 --severity HIGH,CRITICAL $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
 
-      # 10) Update GitOps repo (create branch + PR) using yq (safe YAML edits)
       - name: Update GitOps Repo - branch + PR (yq)
         env:
-          GITOPS_REPO: ${{ env.GITOPS_REPO }}
           GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
         run: |
           set -euo pipefail
-
-          # clone the gitops repo
-          git clone https://github.com/${GITOPS_REPO}.git gitops
+          git clone https://github.com/${{ env.GITOPS_REPO }}.git gitops
           cd gitops
 
-          # local commit identity (no global changes)
           git config user.email "mspr9773@gmail.com"
           git config user.name "Mokadi Surya Prasad"
 
-          # create branch
           BRANCH="auto-update-preprod-${GIT_SHA}"
           git checkout -b "${BRANCH}"
 
-          # export variables so yq can read them
           export NEW_BACKEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA"
           export NEW_FRONTEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA"
 
           echo "NEW_BACKEND=${NEW_BACKEND}"
           echo "NEW_FRONTEND=${NEW_FRONTEND}"
 
-          # install yq if missing
           if ! command -v yq >/dev/null 2>&1; then
-            echo "Installing yq..."
             wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
             chmod +x /usr/local/bin/yq
           fi
 
-          # Update the YAML values safely (works for nested keys)
           yq eval -i '.backend.image = strenv(NEW_BACKEND)' envs/preprod/values-preprod.yaml
           yq eval -i '.frontend.image = strenv(NEW_FRONTEND)' envs/preprod/values-preprod.yaml
 
-          # show diff
           git --no-pager diff -- envs/preprod/values-preprod.yaml || true
 
-          # commit & push branch
           git add envs/preprod/values-preprod.yaml
           git commit -m "Auto-update PreProd images to ${GIT_SHA}" || (echo "no changes to commit" && exit 0)
 
-          # push using token
-          git push https://x-access-token:${GITOPS_PAT}@github.com/${GITOPS_REPO}.git HEAD
+          git push https://x-access-token:${GITOPS_PAT}@github.com/${{ env.GITOPS_REPO }}.git HEAD
 
-          # create PR (against main)
           PR_TITLE="Auto-update PreProd images to ${GIT_SHA}"
           PR_BODY="Automated update of preprod images to ${GIT_SHA}"
-          # Use GitHub API to create PR; will print PR URL on success
           curl -s -X POST \
             -H "Authorization: token ${GITOPS_PAT}" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/${GITOPS_REPO}/pulls \
-            -d "$(jq -n --arg t "$PR_TITLE" --arg b "$PR_BODY" --arg head "$BRANCH" --arg base "main" '{title:$t, body:$b, head:$head, base:$base}')" \
-            | jq -r '.html_url // "PR creation failed or returned no URL"'
-
+            https://api.github.com/repos/${{ env.GITOPS_REPO }}/pulls \
+            -d "{\"title\":\"${PR_TITLE}\",\"body\":\"${PR_BODY}\",\"head\":\"${BRANCH}\",\"base\":\"main\"}" \
+            | sed -n 's/.*html_url\":\"\([^\"]*\)\".*/PR: \1/p' || true
