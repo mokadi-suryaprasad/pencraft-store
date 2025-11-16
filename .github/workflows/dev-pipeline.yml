@@ -1,5 +1,4 @@
-name: Dev Pipeline (Push + PR Merge → Dev Deployment)
-
+name: Dev Pipeline
 on:
   push:
     branches:
