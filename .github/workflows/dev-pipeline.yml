@@ -27,13 +27,11 @@ jobs:
       GIT_SHA: ${{ github.sha }}
 
     steps:
-      # 1) Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) GCP Auth
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -44,12 +42,10 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      # Ensure bucket exists
       - name: Create GCS build bucket if not exists
         run: |
           gsutil ls gs://$BUCKET || gsutil mb -l $REGION gs://$BUCKET
 
-      # 3) Backend build
       - name: Build backend JAR
         working-directory: java-store
         run: mvn -B -DskipTests package
@@ -58,7 +54,6 @@ jobs:
         run: |
           gsutil cp java-store/target/*.jar gs://$BUCKET/$GIT_SHA/backend/
 
-      # 4) Frontend build
       - name: Build frontend (React)
         working-directory: frontend
         run: |
@@ -69,44 +64,37 @@ jobs:
         run: |
           gsutil cp -r frontend/build gs://$BUCKET/$GIT_SHA/frontend/
 
-      # 5) Configure Docker for GAR
       - name: Configure Docker for Artifact Registry
         run: |
           gcloud auth configure-docker $REGION-docker.pkg.dev -q
 
-      # 6) Build backend image
       - name: Build backend Docker image
         run: |
           docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA ./java-store
           docker tag  $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA \
                       $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:latest
 
-      # 7) Build frontend image
       - name: Build frontend Docker image
         run: |
           docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA ./frontend
           docker tag  $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA \
                       $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
 
-      # 8) Install Trivy manually (works 100%)
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
           | sh -s -- -b /usr/local/bin
 
-      # 9) Scan backend image
       - name: Trivy Scan Backend
         run: |
           trivy image --exit-code 0 --severity HIGH,CRITICAL \
           $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA
 
-      # 10) Scan frontend image
       - name: Trivy Scan Frontend
         run: |
           trivy image --exit-code 0 --severity HIGH,CRITICAL \
           $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
 
-      # 11) Push Docker images
       - name: Push backend image
         run: |
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA
@@ -117,8 +105,8 @@ jobs:
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
 
-      # 12) Update GitOps Repo - push directly to main (using yq, safe YAML edit)
-      - name: Update GitOps Repo (pencraft-gitops) - push to main
+      # --- Updated GitOps step (fixed: export variables so yq reads them) ---
+      - name: Update GitOps Repo (pencraft-gitops) - push to main (yq, exported vars)
         env:
           GITOPS_REPO: "mokadi-suryaprasad/pencraft-gitops"
           GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
@@ -133,34 +121,38 @@ jobs:
           git clone https://github.com/${GITOPS_REPO}.git gitops
           cd gitops
 
-          # use a local identity for this commit (avoid altering global)
+          # local commit identity
           git config user.email "mspr9773@gmail.com"
           git config user.name "Mokadi Surya Prasad"
 
-          # ensure we are on latest main
+          # ensure up-to-date main
           git checkout main
           git pull origin main
 
-          # Prepare new image references
-          # Here we set the full image string. Using a tag (sha) instead of digest.
-          NEW_BACKEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA"
-          NEW_FRONTEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA"
+          # Prepare new image references (exported so yq's strenv sees them)
+          export NEW_BACKEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA"
+          export NEW_FRONTEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA"
 
-          # Install mikefarah/yq (if not present)
+          # debug: print the values that will be written
+          echo "NEW_BACKEND=$NEW_BACKEND"
+          echo "NEW_FRONTEND=$NEW_FRONTEND"
+          echo "Will update envs/dev/values-dev.yaml"
+
+          # Install mikefarah/yq if missing
           if ! command -v yq >/dev/null 2>&1; then
             echo "Installing yq..."
             wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
             chmod +x /usr/local/bin/yq
           fi
 
-          # Update YAML fields safely
+          # Update YAML keys safely using yq (v4+ syntax)
           yq eval -i '.backend.image = strenv(NEW_BACKEND)' envs/dev/values-dev.yaml
           yq eval -i '.frontend.image = strenv(NEW_FRONTEND)' envs/dev/values-dev.yaml
 
-          # show diff for logs (helpful for troubleshooting)
+          # show diff for logs
           git --no-pager diff -- envs/dev/values-dev.yaml || true
 
-          # commit & push directly to main
+          # commit & push
           git add envs/dev/values-dev.yaml
           git commit -m "Auto-update Dev images to $GIT_SHA" || echo "no changes to commit"
           git push https://x-access-token:${GITOPS_PAT}@github.com/${GITOPS_REPO}.git main
