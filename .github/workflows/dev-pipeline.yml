@@ -117,7 +117,7 @@ jobs:
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
 
-      # 12) Update GitOps Repo - push directly to main
+      # 12) Update GitOps Repo - push directly to main (fixed: use awk to avoid sed delimiter issues)
       - name: Update GitOps Repo (pencraft-gitops) - push to main
         env:
           GITOPS_REPO: "mokadi-suryaprasad/pencraft-gitops"
@@ -145,9 +145,26 @@ jobs:
           NEW_BACKEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA"
           NEW_FRONTEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA"
 
-          # Use sed to replace the entire line after the key (works with leading spaces)
-          sed -i -E "s@(^[[:space:]]*java-store:[[:space:]]*).*$@\1$NEW_BACKEND@" envs/dev/values-dev.yaml
-          sed -i -E "s@(^[[:space:]]*frontend:[[:space:]]*).*$@\1$NEW_FRONTEND@" envs/dev/values-dev.yaml
+          # Update the file in a safe way using awk (preserves indentation)
+          # - Replace entire line that starts with optional spaces then 'java-store:'
+          # - Replace entire line that starts with optional spaces then 'frontend:'
+          awk -v nb="$NEW_BACKEND" -v nf="$NEW_FRONTEND" '
+            {
+              # match leading whitespace + key
+              if ($0 ~ /^[[:space:]]*java-store:[[:space:]]*/) {
+                # capture leading whitespace
+                match($0, /^[[:space:]]*/)
+                lead = substr($0, RSTART, RLENGTH)
+                print lead "java-store: " nb
+              } else if ($0 ~ /^[[:space:]]*frontend:[[:space:]]*/) {
+                match($0, /^[[:space:]]*/)
+                lead = substr($0, RSTART, RLENGTH)
+                print lead "frontend: " nf
+              } else {
+                print $0
+              }
+            }
+          ' envs/dev/values-dev.yaml > envs/dev/values-dev.yaml.tmp && mv envs/dev/values-dev.yaml.tmp envs/dev/values-dev.yaml
 
           # show diff for logs (helpful for troubleshooting)
           git --no-pager diff -- envs/dev/values-dev.yaml || true
@@ -156,5 +173,3 @@ jobs:
           git add envs/dev/values-dev.yaml
           git commit -m "Auto-update Dev images to $GIT_SHA" || echo "no changes to commit"
           git push https://x-access-token:${GITOPS_PAT}@github.com/${GITOPS_REPO}.git main
-
-
