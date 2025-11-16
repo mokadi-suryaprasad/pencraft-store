@@ -117,37 +117,44 @@ jobs:
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
           docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:latest
 
-      # 12) Update GitOps Repo
-      - name: Update GitOps Repo (pencraft-gitops)
+      # 12) Update GitOps Repo - push directly to main
+      - name: Update GitOps Repo (pencraft-gitops) - push to main
+        env:
+          GITOPS_REPO: "mokadi-suryaprasad/pencraft-gitops"
+          GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+          REGION: ${{ secrets.GCP_REGION }}
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          REPO: pencraft
+          GIT_SHA: ${{ github.sha }}
         run: |
-          GITOPS_REPO="mokadi-suryaprasad/pencraft-gitops"
+          set -euo pipefail
 
-          # Clone repo
-          git clone https://github.com/$GITOPS_REPO.git gitops
+          # clone the gitops repo
+          git clone https://github.com/${GITOPS_REPO}.git gitops
           cd gitops
 
-          # Configure Git Identity Fix (IMPORTANT)
-          git config --global user.email "mspr9773@gmail.com"
-          git config --global user.name "Mokadi Surya Prasad"
+          # use a local identity for this commit (avoid altering global)
+          git config user.email "mspr9773@gmail.com"
+          git config user.name "Mokadi Surya Prasad"
 
-          # Create branch
-          git checkout -b auto-update-dev-$GIT_SHA
+          # ensure we are on latest main
+          git checkout main
+          git pull origin main
 
-          # Update images in dev values
-          sed -i "s|java-store:.*|java-store: $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA|g" envs/dev/values-dev.yaml
-          sed -i "s|frontend:.*|frontend: $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA|g" envs/dev/values-dev.yaml
+          # Prepare new image references
+          NEW_BACKEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA"
+          NEW_FRONTEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA"
 
+          # Use sed to replace the entire line after the key (works with leading spaces)
+          sed -i -E "s@(^[[:space:]]*java-store:[[:space:]]*).*$@\1$NEW_BACKEND@" envs/dev/values-dev.yaml
+          sed -i -E "s@(^[[:space:]]*frontend:[[:space:]]*).*$@\1$NEW_FRONTEND@" envs/dev/values-dev.yaml
+
+          # show diff for logs (helpful for troubleshooting)
+          git --no-pager diff -- envs/dev/values-dev.yaml || true
+
+          # commit & push directly to main
           git add envs/dev/values-dev.yaml
-          git commit -m "Auto-update Dev images to $GIT_SHA"
+          git commit -m "Auto-update Dev images to $GIT_SHA" || echo "no changes to commit"
+          git push https://x-access-token:${GITOPS_PAT}@github.com/${GITOPS_REPO}.git main
 
-          git push https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/$GITOPS_REPO.git HEAD
 
-      # 13) Create PR
-      - name: Create GitOps Pull Request
-        run: |
-          GITOPS_REPO="mokadi-suryaprasad/pencraft-gitops"
-          curl -X POST -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
-          -d "{\"title\":\"Update Dev Images to $GIT_SHA\", \
-               \"head\":\"auto-update-dev-$GIT_SHA\", \
-               \"base\":\"main\"}" \
-          https://api.github.com/repos/$GITOPS_REPO/pulls
