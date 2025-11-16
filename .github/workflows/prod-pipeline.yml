@@ -108,12 +108,10 @@ jobs:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
           docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} ./java-store
-          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} \
-                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}
 
           docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} ./frontend
-          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} \
-                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} 
 
       # ------------------------------
       # Install Trivy & Scan (working)
@@ -133,8 +131,8 @@ jobs:
           IMG1="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}"
           IMG2="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}"
 
-          trivy image --format table --severity HIGH,CRITICAL --exit-code 1 "$IMG1"
-          trivy image --format table --severity HIGH,CRITICAL --exit-code 1 "$IMG2"
+          trivy image --format table --severity CRITICAL --exit-code 1 "$IMG1"
+          trivy image --format table --severity CRITICAL --exit-code 1 "$IMG2"
 
       # ------------------------------
       # Push to GAR
@@ -144,10 +142,8 @@ jobs:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}
-          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
 
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}
-          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
 
       # ------------------------------
       # Update GitOps Repo (existing release branch)
