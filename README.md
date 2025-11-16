@@ -223,6 +223,260 @@ services:
 
 ---
 
+# PenCraftGKE — Step-by-step Commands
+
+This file contains step-by-step commands and instructions to: verify your "pen" entry in the current H2 in-memory setup, and two options to persist storage for `java-store` on GKE — **Option A: Cloud SQL (recommended)**, and **Option B: H2 file mode + PVC (quick demo)**. Copy–paste the commands in Cloud Shell or your terminal.
+
+---
+
+## Quick check: Verify the "pen" was saved (H2 in-memory)
+
+1. List pods & services
+
+```bash
+kubectl -n pencraft-dev get pods,svc
+```
+
+2. Port-forward `java-store` service to localhost:8080 (keep this running)
+
+```bash
+kubectl -n pencraft-dev port-forward svc/java-store 8080:8080
+# In a new terminal run the curl commands below
+```
+
+3. Query the API (likely path: `/api/products`)
+
+```bash
+# show list
+curl -s http://localhost:8080/api/products | jq . || curl -s http://localhost:8080/api/products || true
+
+# get single (if supported)
+curl -s http://localhost:8080/api/products/1 | jq . || true
+```
+
+4. Tail backend logs while repeating the UI action (in another terminal)
+
+```bash
+kubectl -n pencraft-dev logs -f deploy/java-store --tail=200
+```
+
+5. If pod restarted after the POST, H2 memory was lost. Check restarts:
+
+```bash
+kubectl -n pencraft-dev get pods -o custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,AGE:.status.startTime
+kubectl -n pencraft-dev get events --sort-by='.metadata.creationTimestamp' | tail -n 50
+```
+
+---
+
+## Option A — Cloud SQL (Recommended for persistence & production)
+
+### A.1 Create Cloud SQL instance (Postgres example)
+
+```bash
+# create instance (small tier for demo)
+gcloud sql instances create pencraft-db \
+  --database-version=POSTGRES_15 \
+  --tier=db-f1-micro \
+  --region=asia-south1
+
+# create database and user
+gcloud sql databases create pencraft --instance=pencraft-db
+gcloud sql users create appuser --instance=pencraft-db --password='ChangeMe123!'
+```
+
+> Note: replace password with a strong secret and rotate in production.
+
+### A.2 Create a Kubernetes Secret with DB credentials
+
+Create `secret-db.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudsql-credentials
+  namespace: pencraft-dev
+type: Opaque
+stringData:
+  DB_HOST: "127.0.0.1"        # local proxy address used by the sidecar
+  DB_NAME: "pencraft"
+  DB_USER: "appuser"
+  DB_PASS: "ChangeMe123!"
+```
+
+Apply the secret:
+
+```bash
+kubectl apply -f secret-db.yaml
+```
+
+### A.3 Create a Service Account key and store as K8s secret (for Cloud SQL Auth proxy)
+
+1. Create a service account and grant Cloud SQL Client role:
+
+```bash
+gcloud iam service-accounts create pencraft-sql-sa --display-name="pencraft-sql-sa"
+gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
+  --member="serviceAccount:pencraft-sql-sa@$(gcloud config get-value project).iam.gserviceaccount.com" \
+  --role="roles/cloudsql.client"
+```
+
+2. Download key JSON (locally / Cloud Shell):
+
+```bash
+gcloud iam service-accounts keys create key.json \
+  --iam-account=pencraft-sql-sa@$(gcloud config get-value project).iam.gserviceaccount.com
+```
+
+3. Create k8s secret with the key (in pencraft-dev):
+
+```bash
+kubectl create secret generic cloudsql-instance-credentials \
+  --from-file=credentials.json=key.json -n pencraft-dev
+```
+
+### A.4 Patch the `java-store` deployment to add Cloud SQL Auth Proxy sidecar
+
+Create a patch file `cloudsql-sidecar-patch.yaml` (example snippet) and apply via `kubectl patch` or update your Helm chart values.
+
+```yaml
+# cloudsql-sidecar-patch.yaml (snippet to merge into .spec.template.spec)
+spec:
+  template:
+    spec:
+      containers:
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:latest
+          command:
+            - "/cloud_sql_proxy"
+            - "-instances=$(GCP_PROJECT):asia-south1:pencraft-db=tcp:5432"
+            - "-credential_file=/secrets/cloudsql/credentials.json"
+          volumeMounts:
+            - name: cloudsql-instance-credentials
+              mountPath: /secrets/cloudsql
+              readOnly: true
+      volumes:
+        - name: cloudsql-instance-credentials
+          secret:
+            secretName: cloudsql-instance-credentials
+```
+
+Apply the patch (example uses `kubectl patch --patch` or edit via Helm values):
+
+```bash
+kubectl -n pencraft-dev patch deployment java-store --patch-file cloudsql-sidecar-patch.yaml --type=merge
+```
+
+> Alternatively, update your Helm chart `values-dev.yaml` to include the sidecar and env variables, then commit to `pencraft-gitops` and let ArgoCD deploy.
+
+### A.5 Set Spring Boot datasource env variables (via deployment or Helm values)
+
+Add environment variables to `java-store` deployment (use Helm values in GitOps repo):
+
+```yaml
+env:
+  - name: SPRING_DATASOURCE_URL
+    value: "jdbc:postgresql://127.0.0.1:5432/pencraft"
+  - name: SPRING_DATASOURCE_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: cloudsql-credentials
+        key: DB_USER
+  - name: SPRING_DATASOURCE_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: cloudsql-credentials
+        key: DB_PASS
+```
+
+After you update the chart/values, commit & push the change to your GitOps repo and sync ArgoCD.
+
+---
+
+## Option B — H2 file mode + PVC (Quick demo persistent storage)
+
+> Use this for quick persistence without external Cloud SQL. Not recommended for production.
+
+### B.1 Change Spring Boot to file-backed H2
+
+Edit `application.properties` in your app (or set env vars via Helm values):
+
+```
+spring.datasource.url=jdbc:h2:file:/data/h2/pencraft;DB_CLOSE_ON_EXIT=FALSE;AUTO_RECONNECT=TRUE
+spring.datasource.username=sa
+spring.datasource.password=
+```
+
+(Add these to your Helm chart values or `ConfigMap` used by the deployment.)
+
+### B.2 Create a PersistentVolumeClaim
+
+Save as `h2-pvc.yaml` and apply:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: h2-pvc
+  namespace: pencraft-dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard
+```
+
+```bash
+kubectl apply -f h2-pvc.yaml
+```
+
+### B.3 Patch the `java-store` deployment to mount the PVC
+
+Example patch snippet (merge or update via Helm values):
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: java-store
+          volumeMounts:
+            - name: h2-storage
+              mountPath: /data/h2
+      volumes:
+        - name: h2-storage
+          persistentVolumeClaim:
+            claimName: h2-pvc
+```
+
+Apply patch:
+
+```bash
+kubectl -n pencraft-dev patch deployment java-store --patch-file h2-mount-patch.yaml --type=merge
+```
+
+### B.4 Restart deployment and verify
+
+```bash
+kubectl -n pencraft-dev rollout restart deployment/java-store
+kubectl -n pencraft-dev rollout status deployment/java-store
+# port-forward and confirm data persists across pod restarts
+kubectl -n pencraft-dev port-forward svc/java-store 8080:8080 &
+curl -s http://localhost:8080/api/products | jq .
+# restart the pod
+kubectl -n pencraft-dev delete pod $(kubectl -n pencraft-dev get pods -l app=java-store -o jsonpath='{.items[0].metadata.name}')
+# wait for pod to recreate and query again
+curl -s http://localhost:8080/api/products | jq .
+```
+
+If the data persists after pod recreation, H2 file mode + PVC works.
+
+---
+
+
 ## 🚀 CI/CD (Optional)
 
 Supports:
@@ -234,3 +488,5 @@ Supports:
 
 ## 🙌 Contact  
 Feel free to fork and contribute!
+
+
