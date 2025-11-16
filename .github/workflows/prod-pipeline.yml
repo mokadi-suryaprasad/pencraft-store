@@ -22,19 +22,14 @@ jobs:
       PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
       BUCKET: ${{ secrets.GCP_PROJECT_ID }}-builds
       GITOPS_REPO: mokadi-suryaprasad/pencraft-gitops
+      # GITOPS_PAT must be configured in repo secrets
 
     steps:
-
-      # ------------------------------
-      # Checkout
-      # ------------------------------
-      - uses: actions/checkout@v4
+      - name: Checkout repository (full history for tags)
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ------------------------------
-      # Compute release tag
-      # ------------------------------
       - name: Compute RELEASE_TAG
         id: tag
         run: |
@@ -46,6 +41,7 @@ jobs:
             case "${GITHUB_REF}" in
               refs/tags/*) REF_NAME="${GITHUB_REF#refs/tags/}"; REF_TYPE="tag" ;;
               refs/heads/*) REF_NAME="${GITHUB_REF#refs/heads/}"; REF_TYPE="branch" ;;
+              *) REF_NAME="${GITHUB_REF}"; REF_TYPE="other" ;;
             esac
           fi
 
@@ -57,10 +53,8 @@ jobs:
 
           echo "RELEASE_TAG=$RELEASE" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------
-      # GCP Authentication
-      # ------------------------------
       - name: Authenticate to Google Cloud
+        id: gcp-auth
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
@@ -76,22 +70,42 @@ jobs:
 
       - name: Ensure GCS bucket exists
         run: |
+          set -euxo pipefail
           gsutil ls gs://$BUCKET || gsutil mb -l $REGION gs://$BUCKET
 
-      # ------------------------------
-      # Build Backend
-      # ------------------------------
-      - name: Build backend
+      - name: Cache Maven local repo
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build backend (Spring Boot)
         working-directory: java-store
         run: mvn -B -DskipTests package
 
       - name: Upload backend artifact
         run: gsutil cp java-store/target/*.jar gs://$BUCKET/${{ steps.tag.outputs.RELEASE_TAG }}/backend/ || true
 
-      # ------------------------------
-      # Build Frontend (updated: npm install)
-      # ------------------------------
-      - name: Build frontend
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: node-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Build frontend (use npm install)
         working-directory: frontend
         run: |
           npm install
@@ -100,28 +114,19 @@ jobs:
       - name: Upload frontend artifact
         run: gsutil cp -r frontend/build gs://$BUCKET/${{ steps.tag.outputs.RELEASE_TAG }}/frontend/ || true
 
-      # ------------------------------
-      # Docker Image Build
-      # ------------------------------
-      - name: Build images
+      - name: Build and tag images (release)
         env:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
+          set -euxo pipefail
           docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} ./java-store
-          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} \
-                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
-
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
           docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} ./frontend
-          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} \
-                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
 
-      # ------------------------------
-      # Install Trivy & Scan (working)
-      # ------------------------------
       - name: Install Trivy CLI
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
           trivy --version
 
       - name: Trivy Image Scan (fail on HIGH+CRITICAL)
@@ -129,47 +134,42 @@ jobs:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
           set -euxo pipefail
-
           IMG1="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}"
           IMG2="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}"
 
-          trivy image --format table --severity CRITICAL --exit-code 0 "$IMG1"
-          trivy image --format table --severity CRITICAL --exit-code 0 "$IMG2"
+          trivy image --format table --severity HIGH,CRITICAL --exit-code 1 "$IMG1"
+          trivy image --format table --severity HIGH,CRITICAL --exit-code 1 "$IMG2"
 
-      # ------------------------------
-      # Push to GAR
-      # ------------------------------
-      - name: Push images
+      - name: Push images to GAR
         env:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
-
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
 
-      # ------------------------------
-      # Update GitOps Repo (existing release branch)
-      # ------------------------------
-      - name: Update GitOps repo (yq)
+      - name: Update GitOps repo — update existing 'release' branch (yq)
         env:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
           GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
         run: |
           set -euxo pipefail
 
+          echo "Cloning GitOps repo: ${GITOPS_REPO}"
           git clone https://x-access-token:${GITOPS_PAT}@github.com/${GITOPS_REPO}.git gitops
           cd gitops
 
           git config user.email "mspr9773@gmail.com"
           git config user.name "Mokadi Surya Prasad"
 
-          BRANCH="release/${RELEASE}"
+          # ALWAYS update the fixed 'release' branch
+          BRANCH="release"
+          echo "Updating branch: ${BRANCH}"
 
-          # Ensure branch exists
+          # ensure branch exists
           if ! git ls-remote --heads origin "${BRANCH}" | grep -q "${BRANCH}"; then
-            echo "ERROR: Branch ${BRANCH} not found in GitOps repo"
+            echo "ERROR: Branch '${BRANCH}' does not exist in GitOps repo"
             exit 1
           fi
 
@@ -180,22 +180,33 @@ jobs:
           export NEW_BACKEND="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}"
           export NEW_FRONTEND="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}"
 
-          # Install yq if missing
-          if ! command -v yq >/dev/null; then
+          echo "NEW_BACKEND=${NEW_BACKEND}"
+          echo "NEW_FRONTEND=${NEW_FRONTEND}"
+
+          # install yq if needed
+          if ! command -v yq >/dev/null 2>&1; then
             wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
             chmod +x /usr/local/bin/yq
           fi
 
-          # Update YAML
+          echo "Before update (envs/prod/values-prod.yaml):"
+          sed -n '1,200p' envs/prod/values-prod.yaml || true
+          echo "----------"
+
           yq eval -i '.backend.image = strenv(NEW_BACKEND)' envs/prod/values-prod.yaml
           yq eval -i '.frontend.image = strenv(NEW_FRONTEND)' envs/prod/values-prod.yaml
 
+          echo "After update (envs/prod/values-prod.yaml):"
+          sed -n '1,200p' envs/prod/values-prod.yaml || true
+          echo "----------"
+
           git add envs/prod/values-prod.yaml
 
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-            exit 0
+          if git diff --cached --quiet -- envs/prod/values-prod.yaml; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore(release): update prod images to ${RELEASE}"
+            git push https://x-access-token:${GITOPS_PAT}@github.com/${GITOPS_REPO}.git ${BRANCH}
           fi
 
-          git commit -m "chore(release): update prod images to ${RELEASE}"
-          git push origin ${BRANCH}
+          echo "GitOps update complete."
