@@ -95,46 +95,78 @@ jobs:
       - name: Scan frontend image with Trivy
         run: trivy image --exit-code 0 --severity HIGH,CRITICAL $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA
 
-      - name: Update GitOps Repo - branch + PR (yq)
+      - name: Update GitOps Repo — update existing preprod branch (yq) with debug
         env:
           GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
         run: |
           set -euo pipefail
+
+          echo "Cloning GitOps repo: $GITOPS_REPO"
           git clone https://github.com/${{ env.GITOPS_REPO }}.git gitops
           cd gitops
 
           git config user.email "mspr9773@gmail.com"
           git config user.name "Mokadi Surya Prasad"
 
-          BRANCH="auto-update-preprod-${GIT_SHA}"
-          git checkout -b "${BRANCH}"
+          # Checkout the existing preprod branch (do not create)
+          echo "Checking out preprod branch"
+          git fetch origin preprod
+          git checkout preprod
+          git pull origin preprod
 
+          # export so yq can access via strenv()
           export NEW_BACKEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/java-store:$GIT_SHA"
           export NEW_FRONTEND="$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/frontend:$GIT_SHA"
 
           echo "NEW_BACKEND=${NEW_BACKEND}"
           echo "NEW_FRONTEND=${NEW_FRONTEND}"
 
+          # show file before edit
+          echo "---- envs/preprod/values-preprod.yaml (before) ----"
+          sed -n '1,200p' envs/preprod/values-preprod.yaml || true
+          echo "-------------------------------------------------"
+
+          # install yq if missing
           if ! command -v yq >/dev/null 2>&1; then
+            echo "Installing yq..."
             wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
             chmod +x /usr/local/bin/yq
           fi
 
+          echo "yq version:"
+          yq --version || true
+
+          # perform the YAML update
           yq eval -i '.backend.image = strenv(NEW_BACKEND)' envs/preprod/values-preprod.yaml
           yq eval -i '.frontend.image = strenv(NEW_FRONTEND)' envs/preprod/values-preprod.yaml
 
+          # show file after edit
+          echo "---- envs/preprod/values-preprod.yaml (after) ----"
+          sed -n '1,200p' envs/preprod/values-preprod.yaml || true
+          echo "-------------------------------------------------"
+
+          # show the values yq would read back (sanity)
+          echo "yq read backend.image:"
+          yq eval '.backend.image' envs/preprod/values-preprod.yaml || true
+          echo "yq read frontend.image:"
+          yq eval '.frontend.image' envs/preprod/values-preprod.yaml || true
+
+          # Git commit workflow
+          git --no-pager status --porcelain || true
           git --no-pager diff -- envs/preprod/values-preprod.yaml || true
 
           git add envs/preprod/values-preprod.yaml
-          git commit -m "Auto-update PreProd images to ${GIT_SHA}" || (echo "no changes to commit" && exit 0)
+          # commit only if changes staged
+          if git diff --cached --quiet -- envs/preprod/values-preprod.yaml; then
+            echo "No changes to commit."
+          else
+            git commit -m "Auto-update PreProd images to ${GIT_SHA}"
+            echo "Committed changes:"
+            git --no-pager log -1 --pretty=oneline
+          fi
 
-          git push https://x-access-token:${GITOPS_PAT}@github.com/${{ env.GITOPS_REPO }}.git HEAD
+          # push changes back to preprod branch
+          echo "Pushing changes to preprod branch..."
+          git push https://x-access-token:${GITOPS_PAT}@github.com/${{ env.GITOPS_REPO }}.git preprod
 
-          PR_TITLE="Auto-update PreProd images to ${GIT_SHA}"
-          PR_BODY="Automated update of preprod images to ${GIT_SHA}"
-          curl -s -X POST \
-            -H "Authorization: token ${GITOPS_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/${{ env.GITOPS_REPO }}/pulls \
-            -d "{\"title\":\"${PR_TITLE}\",\"body\":\"${PR_BODY}\",\"head\":\"${BRANCH}\",\"base\":\"main\"}" \
-            | sed -n 's/.*html_url\":\"\([^\"]*\)\".*/PR: \1/p' || true
+          echo "Update step complete."
