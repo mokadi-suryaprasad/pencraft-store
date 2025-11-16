@@ -21,9 +21,6 @@ jobs:
       PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
       BUCKET: ${{ secrets.GCP_PROJECT_ID }}-builds
       GITOPS_REPO: ${{ secrets.GITOPS_REPO }}  # owner/repo
-      # Optional: set these secrets if using Workload Identity
-      # WORKLOAD_IDENTITY_PROVIDER: projects/123/locations/global/workloadIdentityPools/pool/providers/provider
-      # GCP_SA_EMAIL: my-sa@PROJECT_ID.iam.gserviceaccount.com
 
     steps:
       - name: Checkout repository (full history for tags)
@@ -35,7 +32,6 @@ jobs:
         id: tag
         run: |
           set -euxo pipefail
-          # Prefer GitHub-provided names (ref_name/ref_type) if available
           REF_NAME="${GITHUB_REF_NAME:-}"
           REF_TYPE="${GITHUB_REF_TYPE:-}"
           if [ -z "$REF_NAME" ]; then
@@ -52,15 +48,12 @@ jobs:
           fi
           echo "RELEASE_TAG=$RELEASE" >> "$GITHUB_OUTPUT"
 
-      ### AUTH: prefer OIDC Workload Identity if configured, else fall back to SA JSON
       - name: Authenticate to Google Cloud (OIDC or SA key)
         id: gcp-auth
         uses: google-github-actions/auth@v2
         with:
-          # If you set WORKLOAD_IDENTITY_PROVIDER & GCP_SA_EMAIL as repo secrets, auth@v2 will use OIDC
           workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
-          # If you prefer to use JSON key, set GCP_SA_KEY secret and uncomment the next field:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Setup gcloud (export ADC so gsutil picks it up)
@@ -76,10 +69,8 @@ jobs:
       - name: Ensure GCS bucket exists
         run: |
           set -euxo pipefail
-          # gsutil will now use Application Default Credentials exported by setup-gcloud
           gsutil ls gs://$BUCKET || gsutil mb -l $REGION gs://$BUCKET
 
-      # Cache Maven
       - name: Cache Maven local repo
         uses: actions/cache@v4
         with:
@@ -101,7 +92,6 @@ jobs:
         run: |
           gsutil cp java-store/target/*.jar gs://$BUCKET/${{ steps.tag.outputs.RELEASE_TAG }}/backend/ || true
 
-      # Cache node modules
       - name: Cache node modules
         uses: actions/cache@v4
         with:
@@ -144,7 +134,7 @@ jobs:
             ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${{ steps.tag.outputs.RELEASE_TAG }}
           format: 'table'
           severity: 'CRITICAL,HIGH'
-          exit-code: '1'   # 1 = fail workflow on findings
+          exit-code: '1'
 
       - name: Push images to GAR
         env:
@@ -155,47 +145,81 @@ jobs:
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
 
-      - name: Update GitOps repo (create release branch and update values)
+      - name: Update GitOps repo — update existing release branch (no branch creation)
         env:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
+          GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
         run: |
           set -euxo pipefail
-          # Use token-authenticated clone (GITOPS_REPO should be owner/repo)
-          git clone https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/${{ secrets.GITOPS_REPO }}.git gitops
+
+          echo "Cloning GitOps repo: ${{ secrets.GITOPS_REPO }}"
+          git clone https://x-access-token:${GITOPS_PAT}@github.com/${{ secrets.GITOPS_REPO }}.git gitops
           cd gitops
+
           git config user.email "mspr9773@gmail.com"
           git config user.name "Mokadi Surya Prasad"
+
           BRANCH="release/${RELEASE}"
-          if git ls-remote --heads origin "${BRANCH}" | grep -q "${BRANCH}"; then
-            git checkout "${BRANCH}"
-          else
-            git checkout -b "${BRANCH}"
+          echo "Will update existing branch: ${BRANCH}"
+
+          # Ensure branch exists on remote; fail fast if not
+          if ! git ls-remote --heads origin "${BRANCH}" | grep -q "${BRANCH}"; then
+            echo "ERROR: branch ${BRANCH} does not exist in gitops repo. Exiting."
+            exit 1
           fi
 
-          # Update YAML values: use yq when available, else sed fallback
-          if command -v yq >/dev/null 2>&1; then
-            yq eval ".java-store = \"${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}\"" -i envs/prod/values-prod.yaml
-            yq eval ".frontend = \"${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}\"" -i envs/prod/values-prod.yaml
-          else
-            sed -i "s|java-store:.*|java-store: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}|g" envs/prod/values-prod.yaml
-            sed -i "s|frontend:.*|frontend: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}|g" envs/prod/values-prod.yaml
+          git fetch origin "${BRANCH}"
+          git checkout "${BRANCH}"
+          git pull origin "${BRANCH}"
+
+          # Prepare new image strings (tag-based)
+          export NEW_BACKEND="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}"
+          export NEW_FRONTEND="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}"
+
+          echo "NEW_BACKEND=${NEW_BACKEND}"
+          echo "NEW_FRONTEND=${NEW_FRONTEND}"
+
+          # show file before edit
+          echo "---- envs/prod/values-prod.yaml (before) ----"
+          sed -n '1,200p' envs/prod/values-prod.yaml || true
+          echo "---------------------------------------------"
+
+          # install yq if missing
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "Installing yq..."
+            wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x /usr/local/bin/yq
           fi
 
+          echo "yq version: $(yq --version || true)"
+
+          # Update nested YAML keys safely. Adjust paths if your YAML uses different keys.
+          # We're targeting:
+          # backend.image
+          # frontend.image
+          yq eval -i '.backend.image = strenv(NEW_BACKEND)' envs/prod/values-prod.yaml
+          yq eval -i '.frontend.image = strenv(NEW_FRONTEND)' envs/prod/values-prod.yaml
+
+          # show file after edit
+          echo "---- envs/prod/values-prod.yaml (after) ----"
+          sed -n '1,200p' envs/prod/values-prod.yaml || true
+          echo "--------------------------------------------"
+
+          # show read-back sanity checks
+          echo "yq read backend.image: $(yq eval '.backend.image' envs/prod/values-prod.yaml || true)"
+          echo "yq read frontend.image: $(yq eval '.frontend.image' envs/prod/values-prod.yaml || true)"
+
+          # Git commit & push
           git add envs/prod/values-prod.yaml
-          git commit -m "chore(release): update prod images to ${RELEASE}" || echo "No changes to commit"
-          git push origin HEAD
-
-      - name: Create PR for production release (if none exists)
-        env:
-          RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
-        run: |
-          BRANCH="release/${RELEASE}"
-          EXISTING_PR=$(curl -s -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
-            "https://api.github.com/repos/${{ secrets.GITOPS_REPO }}/pulls?head=${{ github.repository_owner }}:${BRANCH}&state=open" | jq '.[0].html_url // empty' -r)
-          if [ -n "$EXISTING_PR" ]; then
-            echo "PR already exists: $EXISTING_PR"
+          if git diff --cached --quiet -- envs/prod/values-prod.yaml; then
+            echo "No changes to commit."
           else
-            curl -s -X POST -H "Authorization: token ${{ secrets.GITOPS_PAT }}" \
-              -d "{\"title\":\"Release ${RELEASE}: update prod images\",\"head\":\"${BRANCH}\",\"base\":\"main\",\"body\":\"Release ${RELEASE} - update Helm images\"}" \
-              "https://api.github.com/repos/${{ secrets.GITOPS_REPO }}/pulls"
+            git commit -m "chore(release): update prod images to ${RELEASE}"
+            echo "Committed:"
+            git --no-pager log -1 --pretty=oneline
           fi
+
+          echo "Pushing branch ${BRANCH}..."
+          git push https://x-access-token:${GITOPS_PAT}@github.com/${{ secrets.GITOPS_REPO }}.git ${BRANCH}
+
+          echo "Update complete."
