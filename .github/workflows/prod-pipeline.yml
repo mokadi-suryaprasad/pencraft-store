@@ -108,10 +108,12 @@ jobs:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
           docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} ./java-store
-          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE} \
+                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
 
           docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} ./frontend
-          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} 
+          docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE} \
+                     ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
 
       # ------------------------------
       # Install Trivy & Scan (working)
@@ -142,8 +144,10 @@ jobs:
           RELEASE: ${{ steps.tag.outputs.RELEASE_TAG }}
         run: |
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:${RELEASE}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/java-store:latest
 
           docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:${RELEASE}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/frontend:latest
 
       # ------------------------------
       # Update GitOps Repo (existing release branch)
